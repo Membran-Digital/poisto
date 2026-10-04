@@ -319,6 +319,7 @@ fn mark_cleansed(path: &Path) {
 pub struct AppState {
     watchers: Arc<Mutex<HashMap<String, RecommendedWatcher>>>,
     active_processing: Arc<Mutex<HashSet<String>>>,
+    stats: Arc<Mutex<PoistoStats>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -326,6 +327,65 @@ struct FileProcessedPayload {
     file_name: String,
     directory: String,
     status: String,
+}
+
+use serde::Deserialize;
+
+// --- Persistent Stats Tracking ---
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct PoistoStats {
+    pub images_cleaned: u64,
+    pub pdfs_cleaned: u64,
+    pub videos_cleaned: u64,
+}
+
+impl PoistoStats {
+    pub fn total(&self) -> u64 {
+        self.images_cleaned + self.pdfs_cleaned + self.videos_cleaned
+    }
+
+    pub fn load(app_handle: &AppHandle) -> Self {
+        let path = get_stats_path(app_handle);
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(stats) = serde_json::from_str(&data) {
+                return stats;
+            }
+        }
+        Self::default()
+    }
+
+    pub fn save(&self, app_handle: &AppHandle) {
+        let path = get_stats_path(app_handle);
+        if let Ok(data) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(&path, data);
+        }
+    }
+}
+
+fn get_stats_path(app_handle: &AppHandle) -> PathBuf {
+    app_handle
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::env::current_dir().unwrap())
+        .join("poisto_stats.json")
+}
+
+// Helper: Record a successful clean and notify the UI
+fn record_success(app_handle: &AppHandle, stats: &Arc<Mutex<PoistoStats>>, ext: &str) {
+    let mut stats_lock = stats.lock().unwrap();
+    match ext {
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" => stats_lock.images_cleaned += 1,
+        "pdf" => stats_lock.pdfs_cleaned += 1,
+        _ => stats_lock.videos_cleaned += 1,
+    }
+    let stats_clone = stats_lock.clone();
+    drop(stats_lock);
+
+    // Persist to disk
+    stats_clone.save(app_handle);
+
+    // Emit to frontend for real-time UI update
+    let _ = app_handle.emit("stats_updated", stats_clone);
 }
 
 fn wait_for_file_ready(path: &Path) -> Result<(), String> {
@@ -344,11 +404,16 @@ fn wait_for_file_ready(path: &Path) -> Result<(), String> {
 }
 
 // --- Initial Bulk Scan ---
-fn scan_and_clean_existing_files(app_handle: &AppHandle, dir_path: String) {
+fn scan_and_clean_existing_files(
+    app_handle: &AppHandle,
+    stats: Arc<Mutex<PoistoStats>>,
+    dir_path: String,
+) {
     let extensions = [
         "jpg", "jpeg", "png", "gif", "bmp", "webp", "pdf", "mp4", "mov", "avi", "mkv", "webm",
     ];
     let app_clone = app_handle.clone();
+    let stats_clone = stats.clone();
     let dir_clone = dir_path.clone();
 
     std::thread::spawn(move || {
@@ -358,6 +423,11 @@ fn scan_and_clean_existing_files(app_handle: &AppHandle, dir_path: String) {
             }
 
             let path = entry.path().to_path_buf();
+
+            if path.to_string_lossy().contains(".poisto_tmp.") {
+                continue;
+            }
+
             let ext = path
                 .extension()
                 .and_then(|s| s.to_str())
@@ -368,7 +438,6 @@ fn scan_and_clean_existing_files(app_handle: &AppHandle, dir_path: String) {
                 continue;
             }
 
-            // CHECK FLAG BEFORE DOING ANY WORK
             if is_cleansed(&path) {
                 let file_name = path.file_name().unwrap().to_string_lossy().to_string();
                 let _ = app_clone.emit(
@@ -384,7 +453,6 @@ fn scan_and_clean_existing_files(app_handle: &AppHandle, dir_path: String) {
 
             let file_name = path.file_name().unwrap().to_string_lossy().to_string();
 
-            // Process the file immediately (No "cleaning" status emitted)
             let status = match ext.as_str() {
                 "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" => process_image(&path),
                 "pdf" => process_pdf(&path),
@@ -409,6 +477,7 @@ fn scan_and_clean_existing_files(app_handle: &AppHandle, dir_path: String) {
 
             if is_success {
                 mark_cleansed(&path);
+                record_success(&app_clone, &stats_clone, &ext);
             }
         }
     });
@@ -558,7 +627,7 @@ async fn add_directory(
     path: String,
 ) -> Result<(), String> {
     start_watcher(&app, &state, path.clone())?;
-    scan_and_clean_existing_files(&app, path);
+    scan_and_clean_existing_files(&app, state.stats.clone(), path);
     Ok(())
 }
 
@@ -567,6 +636,11 @@ async fn remove_directory(state: State<'_, AppState>, path: String) -> Result<()
     let mut watchers = state.watchers.lock().unwrap();
     watchers.remove(&path);
     Ok(())
+}
+
+#[tauri::command]
+async fn get_stats(state: State<'_, AppState>) -> Result<PoistoStats, String> {
+    Ok(state.stats.lock().unwrap().clone())
 }
 
 #[tauri::command]
@@ -656,9 +730,17 @@ pub fn run() {
         .manage(AppState {
             watchers: Arc::new(Mutex::new(HashMap::new())),
             active_processing: Arc::new(Mutex::new(HashSet::new())),
+            stats: Arc::new(Mutex::new(PoistoStats::default())),
         })
         .setup(|app| {
             let state = app.state::<AppState>();
+
+            // Load persisted stats on startup
+            {
+                let mut stats_lock = state.stats.lock().unwrap();
+                *stats_lock = PoistoStats::load(app.handle());
+            }
+
             let dirs_to_watch = state
                 .watchers
                 .lock()
@@ -669,7 +751,7 @@ pub fn run() {
 
             for dir in dirs_to_watch {
                 let _ = start_watcher(app.handle(), &state, dir.clone());
-                scan_and_clean_existing_files(app.handle(), dir);
+                scan_and_clean_existing_files(app.handle(), state.stats.clone(), dir);
             }
             Ok(())
         })
@@ -678,6 +760,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             add_directory,
             remove_directory,
+            get_stats,
             get_directories
         ])
         .run(tauri::generate_context!())
