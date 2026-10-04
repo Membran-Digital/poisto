@@ -29,6 +29,7 @@ tokio = "1.53.1"
 image = "0.25.10"
 lopdf = "0.45.0"
 notify = "8.2.0"
+scopeguard = "1.2.0"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

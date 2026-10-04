@@ -3277,6 +3277,7 @@ dependencies = [
  "lopdf",
  "notify",
  "rayon",
+ "scopeguard",
  "serde",
  "serde_json",
  "tauri",
