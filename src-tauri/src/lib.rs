@@ -8,11 +8,201 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use walkdir::WalkDir;
 
-// Helper to get the hidden Alternate Data Stream path (e.g., "image.jpg:poisto_cleansed")
-fn get_ads_path(path: &Path) -> OsString {
-    let mut ads_path = OsString::from(path.as_os_str());
-    ads_path.push(":poisto_cleansed");
-    ads_path
+// --- FFmpeg Auto-Discovery & Auto-Download (Zero Dependencies) ---
+
+fn get_ffmpeg_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
+    // 1. Check system PATH first (respects users who already have it)
+    if std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return Ok(PathBuf::from("ffmpeg"));
+    }
+
+    // 2. Check if we already downloaded it to app data dir
+    let ffmpeg_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("ffmpeg");
+
+    let binary_name = if cfg!(target_os = "windows") {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
+    let ffmpeg_bin = ffmpeg_dir.join(binary_name);
+
+    if ffmpeg_bin.exists() {
+        return Ok(ffmpeg_bin);
+    }
+
+    // 3. Auto-download static FFmpeg build (one-time)
+    download_ffmpeg(&ffmpeg_dir)?;
+
+    if ffmpeg_bin.exists() {
+        Ok(ffmpeg_bin)
+    } else {
+        Err("FFmpeg download completed but binary not found".to_string())
+    }
+}
+
+fn download_ffmpeg(target_dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(target_dir)
+        .map_err(|e| format!("Failed to create ffmpeg dir: {}", e))?;
+
+    let archive_name = if cfg!(target_os = "windows") || cfg!(target_os = "macos") {
+        "ffmpeg_archive.zip"
+    } else {
+        "ffmpeg_archive.tar.xz"
+    };
+
+    // 1. Determine the correct download URL based on OS and Architecture
+    let url = if cfg!(target_os = "windows") {
+        "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip".to_string()
+    } else if cfg!(target_os = "macos") {
+        "https://evermeet.cx/ffmpeg/getrelease/zip".to_string()
+    } else {
+        // Linux: Detect architecture (x86_64 vs aarch64/arm64 vs arm)
+        let arch = std::env::consts::ARCH;
+        let arch_str = match arch {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            "arm" => "armhf",
+            _ => {
+                return Err(format!(
+                    "Unsupported Linux architecture for auto-download: {}",
+                    arch
+                ))
+            }
+        };
+        format!(
+            "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-{}-static.tar.xz",
+            arch_str
+        )
+    };
+
+    let archive_path = target_dir.join(archive_name);
+    let archive_str = archive_path.to_str().ok_or("Invalid archive path")?;
+    let target_str = target_dir.to_str().ok_or("Invalid target path")?;
+
+    // 2. Download using the most reliable tool per platform
+    let download_result = if cfg!(target_os = "windows") {
+        let ps_cmd = format!(
+            "try {{ Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing -ErrorAction Stop; exit 0 }} catch {{ Write-Host $_.Exception.Message; exit 1 }}",
+            url, archive_str.replace('\\', "\\\\")
+        );
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
+            .output()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("/usr/bin/curl")
+            .args([
+                "-L",
+                "--fail",
+                "--silent",
+                "--show-error",
+                "-o",
+                archive_str,
+                &url,
+            ])
+            .output()
+    } else {
+        // Linux: curl with wget fallback
+        let curl_result = std::process::Command::new("/usr/bin/curl")
+            .args([
+                "-L",
+                "--fail",
+                "--silent",
+                "--show-error",
+                "-o",
+                archive_str,
+                &url,
+            ])
+            .output();
+
+        match curl_result {
+            Ok(output) if output.status.success() => Ok(output),
+            _ => std::process::Command::new("/usr/bin/wget")
+                .args(["-q", "-O", archive_str, &url])
+                .output(),
+        }
+    };
+
+    let output = download_result.map_err(|e| format!("Download command failed to start: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "FFmpeg download failed (status: {:?}). Stderr: {} Stdout: {}",
+            output.status.code(),
+            stderr,
+            stdout
+        ));
+    }
+
+    // 3. Verify the archive was actually created and has size
+    match std::fs::metadata(&archive_path) {
+        Ok(meta) if meta.len() > 1000 => { /* Good, archive downloaded */ }
+        Ok(meta) => {
+            let _ = std::fs::remove_file(&archive_path);
+            return Err(format!(
+                "Downloaded file too small ({} bytes), likely a redirect/error page",
+                meta.len()
+            ));
+        }
+        Err(e) => return Err(format!("Archive not found after download: {}", e)),
+    }
+
+    // 4. Extract using tar
+    let extract = std::process::Command::new("tar")
+        .args(["-xf", archive_str, "-C", target_str])
+        .output()
+        .map_err(|e| format!("tar error: {}", e))?;
+
+    let _ = std::fs::remove_file(&archive_path);
+
+    if !extract.status.success() {
+        return Err(format!(
+            "Extraction failed: {}",
+            String::from_utf8_lossy(&extract.stderr)
+        ));
+    }
+
+    // 5. Find and move the binary to the root of target_dir
+    let binary_name = if cfg!(target_os = "windows") {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
+    let dest = target_dir.join(binary_name);
+
+    if !dest.exists() {
+        find_and_move_ffmpeg(target_dir, binary_name, &dest)?;
+    }
+
+    // 6. Make executable on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+    }
+
+    Ok(())
+}
+
+fn find_and_move_ffmpeg(search_dir: &Path, binary_name: &str, dest: &Path) -> Result<(), String> {
+    for entry in WalkDir::new(search_dir).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file() && entry.file_name() == binary_name {
+            std::fs::copy(entry.path(), dest)
+                .map_err(|e| format!("Failed to copy ffmpeg binary: {}", e))?;
+            return Ok(());
+        }
+    }
+    Err("ffmpeg binary not found inside the downloaded archive".to_string())
 }
 
 fn is_cleansed(path: &Path) -> bool {
@@ -138,15 +328,6 @@ struct FileProcessedPayload {
     status: String,
 }
 
-// --- Helpers: Pure, Lean File Flagging ---
-
-fn get_flag_path(path: &Path) -> PathBuf {
-    // Creates a 0-byte sidecar file: "image.jpg" -> "image.jpg.poisto"
-    // This is universally supported, 0 bytes, and survives USB/Cloud transfers.
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-    path.with_extension(format!("{}.poisto", ext))
-}
-
 fn wait_for_file_ready(path: &Path) -> Result<(), String> {
     let mut last_size = 0;
     for _ in 0..50 {
@@ -207,7 +388,7 @@ fn scan_and_clean_existing_files(app_handle: &AppHandle, dir_path: String) {
             let status = match ext.as_str() {
                 "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" => process_image(&path),
                 "pdf" => process_pdf(&path),
-                _ => process_video(&path),
+                _ => process_video(&path, &app_clone),
             };
 
             let is_success = status.is_ok();
@@ -258,6 +439,9 @@ fn start_watcher(
                         }
 
                         let path_str = file_path.to_string_lossy().to_string();
+                        if (&path_str).contains(".poisto_tmp.") {
+                            continue;
+                        }
 
                         {
                             let mut active = active_for_closure.lock().unwrap();
@@ -326,7 +510,7 @@ fn start_watcher(
                                         process_image(&file_path_clone)
                                     }
                                     "pdf" => process_pdf(&file_path_clone),
-                                    _ => process_video(&file_path_clone),
+                                    _ => process_video(&file_path_clone, &app_emit),
                                 };
 
                                 let is_success = status.is_ok();
@@ -423,11 +607,20 @@ fn process_pdf(path: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn process_video(path: &PathBuf) -> Result<(), String> {
+fn process_video(path: &PathBuf, app_handle: &AppHandle) -> Result<(), String> {
+    let ffmpeg = get_ffmpeg_path(app_handle)?;
     let path_str = path.to_str().ok_or("Invalid path")?;
-    let temp_path = format!("{}.poisto_tmp", path_str);
 
-    let output = std::process::Command::new("ffmpeg")
+    // Extract the original extension (mp4, mov, mkv, etc.) to tell FFmpeg the output format
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("mp4");
+    let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("video");
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+
+    // Build temp path with extension at the END: "video.poisto_tmp.mp4"
+    let temp_path_buf = parent.join(format!("{}.poisto_tmp.{}", file_stem, ext));
+    let temp_path_str = temp_path_buf.to_str().ok_or("Invalid temp path")?;
+
+    let output = std::process::Command::new(&ffmpeg)
         .args([
             "-y",
             "-i",
@@ -440,18 +633,18 @@ fn process_video(path: &PathBuf) -> Result<(), String> {
             "copy",
             "-c:a",
             "copy",
-            &temp_path,
+            temp_path_str, // Extension is at the end, so FFmpeg knows the format
         ])
         .output()
         .map_err(|e| format!("ffmpeg execution error: {}", e))?;
 
     if !output.status.success() {
-        let _ = std::fs::remove_file(&temp_path);
+        let _ = std::fs::remove_file(&temp_path_buf);
         return Err(String::from_utf8_lossy(&output.stderr).to_string());
     }
 
-    std::fs::rename(&temp_path, path_str).map_err(|e| {
-        let _ = std::fs::remove_file(&temp_path);
+    std::fs::rename(&temp_path_buf, path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp_path_buf);
         e.to_string()
     })?;
     Ok(())

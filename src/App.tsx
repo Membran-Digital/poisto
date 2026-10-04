@@ -171,6 +171,9 @@ function App() {
                         const isSuccess = log.status === "success";
                         const isSkipped = log.status === "skipped";
                         const isError = !isSuccess && !isSkipped;
+                        if (isError) {
+                          console.error(log.status);
+                        }
 
                         return (
                           <div
