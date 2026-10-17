@@ -362,6 +362,69 @@ impl PoistoStats {
     }
 }
 
+// --- Persistent Config (Watched Directories) ---
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct PoistoConfig {
+    pub watched_directories: Vec<String>,
+}
+
+impl PoistoConfig {
+    pub fn load(app_handle: &AppHandle) -> Self {
+        let path = get_config_path(app_handle);
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(config) = serde_json::from_str(&data) {
+                return config;
+            }
+        }
+        Self::default()
+    }
+
+    pub fn save(&self, app_handle: &AppHandle) {
+        let path = get_config_path(app_handle);
+        if let Ok(data) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(&path, data);
+        }
+    }
+}
+
+fn get_config_path(app_handle: &AppHandle) -> PathBuf {
+    app_handle
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::env::current_dir().unwrap())
+        .join("poisto_config.json")
+}
+
+/// Normalizes a path for consistent comparison across platforms.
+/// Handles trailing slashes, symlinks, and Windows case-insensitivity.
+fn normalize_path(path: &str) -> String {
+    let p = Path::new(path);
+    let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| {
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(p))
+                .unwrap_or_else(|_| p.to_path_buf())
+        }
+    });
+
+    let s = canonical.to_string_lossy().to_string();
+    // Strip Windows extended-length path prefix (\\?\)
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
+
+    #[cfg(target_os = "windows")]
+    {
+        // Windows: normalize to forward slashes + lowercase for case-insensitive comparison
+        s.replace('\\', "/").to_lowercase()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Unix: just strip trailing slashes
+        s.trim_end_matches('/').to_string()
+    }
+}
+
 fn get_stats_path(app_handle: &AppHandle) -> PathBuf {
     app_handle
         .path()
@@ -488,10 +551,18 @@ fn start_watcher(
     app_handle: &AppHandle,
     state: &State<'_, AppState>,
     path: String,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    let normalized_input = normalize_path(&path);
+
     let mut watchers_lock = state.watchers.lock().unwrap();
-    if watchers_lock.contains_key(&path) {
-        return Ok(());
+
+    // Check for duplicates using normalized comparison
+    let already_exists = watchers_lock
+        .keys()
+        .any(|existing| normalize_path(existing) == normalized_input);
+
+    if already_exists {
+        return Ok(false);
     }
 
     let app_for_closure = app_handle.clone();
@@ -555,7 +626,6 @@ fn start_watcher(
                                     return;
                                 }
 
-                                // CHECK FLAG BEFORE DOING ANY WORK
                                 if is_cleansed(&file_path_clone) {
                                     let _ = app_emit.emit(
                                         "file_processed",
@@ -615,7 +685,20 @@ fn start_watcher(
         .watch(Path::new(&path), RecursiveMode::Recursive)
         .map_err(|e| e.to_string())?;
     watchers_lock.insert(path.clone(), watcher);
-    Ok(())
+    drop(watchers_lock);
+
+    // Persist the new directory to config
+    let mut config = PoistoConfig::load(app_handle);
+    if !config
+        .watched_directories
+        .iter()
+        .any(|d| normalize_path(d) == normalized_input)
+    {
+        config.watched_directories.push(path);
+        config.save(app_handle);
+    }
+
+    Ok(true)
 }
 
 // --- Tauri Commands ---
@@ -626,15 +709,41 @@ async fn add_directory(
     app: AppHandle,
     path: String,
 ) -> Result<(), String> {
-    start_watcher(&app, &state, path.clone())?;
-    scan_and_clean_existing_files(&app, state.stats.clone(), path);
+    let was_new = start_watcher(&app, &state, path.clone())?;
+    if was_new {
+        // Only scan if this is a newly added directory (prevents re-scanning duplicates)
+        scan_and_clean_existing_files(&app, state.stats.clone(), path);
+    }
     Ok(())
 }
 
 #[tauri::command]
-async fn remove_directory(state: State<'_, AppState>, path: String) -> Result<(), String> {
+async fn remove_directory(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    path: String,
+) -> Result<(), String> {
+    let normalized_input = normalize_path(&path);
+
+    // Find and remove the matching watcher by normalized comparison
     let mut watchers = state.watchers.lock().unwrap();
-    watchers.remove(&path);
+    let key_to_remove = watchers
+        .keys()
+        .find(|k| normalize_path(k) == normalized_input)
+        .cloned();
+
+    if let Some(key) = key_to_remove {
+        watchers.remove(&key);
+    }
+    drop(watchers);
+
+    // Persist the removal
+    let mut config = PoistoConfig::load(&app);
+    config
+        .watched_directories
+        .retain(|d| normalize_path(d) != normalized_input);
+    config.save(&app);
+
     Ok(())
 }
 
@@ -735,24 +844,21 @@ pub fn run() {
         .setup(|app| {
             let state = app.state::<AppState>();
 
-            // Load persisted stats on startup
+            // 1. Load persisted stats on startup
             {
                 let mut stats_lock = state.stats.lock().unwrap();
                 *stats_lock = PoistoStats::load(app.handle());
             }
 
-            let dirs_to_watch = state
-                .watchers
-                .lock()
-                .unwrap()
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>();
+            // 2. Load persisted watched directories
+            let config = PoistoConfig::load(app.handle());
 
-            for dir in dirs_to_watch {
+            // 3. Re-register all watchers and trigger bulk scan
+            for dir in config.watched_directories {
                 let _ = start_watcher(app.handle(), &state, dir.clone());
                 scan_and_clean_existing_files(app.handle(), state.stats.clone(), dir);
             }
+
             Ok(())
         })
         .plugin(tauri_plugin_dialog::init())
